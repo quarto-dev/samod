@@ -4,6 +4,7 @@ use samod_core::PeerId;
 
 use crate::{
     Repo,
+    access_policy::{AccessPolicy, AllowAll},
     announce_policy::{AlwaysAnnounce, AnnouncePolicy, LocalAnnouncePolicy},
     observer::RepoObserver,
     runtime::{LocalRuntimeHandle, RuntimeHandle},
@@ -36,33 +37,36 @@ pub enum ConcurrencyConfig {
 /// announce policy implementations to be implementations of [`LocalStorage`]
 /// and [`LocalAnnouncePolicy`] respectively. See the [module level
 /// documentation on runtimes](./index.html#runtimes) for more details.
-pub struct RepoBuilder<S, R, A> {
+pub struct RepoBuilder<S, R, A, Ac = AllowAll> {
     pub(crate) storage: S,
     pub(crate) runtime: R,
     pub(crate) announce_policy: A,
+    pub(crate) access_policy: Ac,
     pub(crate) peer_id: Option<PeerId>,
     pub(crate) concurrency: ConcurrencyConfig,
     pub(crate) observer: Option<Arc<dyn RepoObserver>>,
 }
 
-impl<S, R, A> RepoBuilder<S, R, A> {
-    pub fn with_storage<S2>(self, storage: S2) -> RepoBuilder<S2, R, A> {
+impl<S, R, A, Ac> RepoBuilder<S, R, A, Ac> {
+    pub fn with_storage<S2>(self, storage: S2) -> RepoBuilder<S2, R, A, Ac> {
         RepoBuilder {
             storage,
             peer_id: self.peer_id,
             runtime: self.runtime,
             announce_policy: self.announce_policy,
+            access_policy: self.access_policy,
             concurrency: self.concurrency,
             observer: self.observer,
         }
     }
 
-    pub fn with_runtime<R2>(self, runtime: R2) -> RepoBuilder<S, R2, A> {
+    pub fn with_runtime<R2>(self, runtime: R2) -> RepoBuilder<S, R2, A, Ac> {
         RepoBuilder {
             runtime,
             peer_id: self.peer_id,
             storage: self.storage,
             announce_policy: self.announce_policy,
+            access_policy: self.access_policy,
             concurrency: self.concurrency,
             observer: self.observer,
         }
@@ -73,12 +77,30 @@ impl<S, R, A> RepoBuilder<S, R, A> {
         self
     }
 
-    pub fn with_announce_policy<A2>(self, announce_policy: A2) -> RepoBuilder<S, R, A2> {
+    pub fn with_announce_policy<A2>(self, announce_policy: A2) -> RepoBuilder<S, R, A2, Ac> {
         RepoBuilder {
             runtime: self.runtime,
             peer_id: self.peer_id,
             storage: self.storage,
             announce_policy,
+            access_policy: self.access_policy,
+            concurrency: self.concurrency,
+            observer: self.observer,
+        }
+    }
+
+    /// Configure the access control policy for the repository.
+    ///
+    /// See [`AccessPolicy`] for the semantics. Unlike the announce policy, the
+    /// access policy is set once and cannot be changed after the repository is
+    /// built.
+    pub fn with_access_policy<Ac2>(self, access_policy: Ac2) -> RepoBuilder<S, R, A, Ac2> {
+        RepoBuilder {
+            runtime: self.runtime,
+            peer_id: self.peer_id,
+            storage: self.storage,
+            announce_policy: self.announce_policy,
+            access_policy,
             concurrency: self.concurrency,
             observer: self.observer,
         }
@@ -100,28 +122,35 @@ impl<S, R, A> RepoBuilder<S, R, A> {
     }
 }
 
-impl<R> RepoBuilder<InMemoryStorage, R, AlwaysAnnounce> {
-    pub fn new(runtime: R) -> RepoBuilder<InMemoryStorage, R, AlwaysAnnounce> {
+impl<R> RepoBuilder<InMemoryStorage, R, AlwaysAnnounce, AllowAll> {
+    pub fn new(runtime: R) -> RepoBuilder<InMemoryStorage, R, AlwaysAnnounce, AllowAll> {
         RepoBuilder {
             storage: InMemoryStorage::new(),
             runtime,
             peer_id: None,
             announce_policy: AlwaysAnnounce,
+            access_policy: AllowAll,
             concurrency: ConcurrencyConfig::AsyncRuntime,
             observer: None,
         }
     }
 }
 
-impl<S: Storage, R: RuntimeHandle + Clone + Send, A: AnnouncePolicy> RepoBuilder<S, R, A> {
+impl<S: Storage, R: RuntimeHandle + Clone + Send, A: AnnouncePolicy, Ac: AccessPolicy>
+    RepoBuilder<S, R, A, Ac>
+{
     /// Create the repository
     pub async fn load(self) -> Repo {
         Repo::load(self).await
     }
 }
 
-impl<S: LocalStorage, R: LocalRuntimeHandle + Clone + 'static, A: LocalAnnouncePolicy>
-    RepoBuilder<S, R, A>
+impl<
+    S: LocalStorage,
+    R: LocalRuntimeHandle + Clone + 'static,
+    A: LocalAnnouncePolicy,
+    Ac: AccessPolicy,
+> RepoBuilder<S, R, A, Ac>
 {
     /// Create the repository
     pub async fn load_local(self) -> Repo {

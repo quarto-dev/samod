@@ -1,3 +1,5 @@
+mod access_policy;
+pub(crate) use access_policy::{AccessPolicy, allow_all};
 mod command;
 
 pub(crate) use command::Command;
@@ -19,7 +21,10 @@ pub(crate) mod listener;
 mod state;
 pub(crate) use state::State;
 
-use crate::{ConnectionId, PeerId, SamodLoader, StorageId, UnixTimestamp, network::ConnectionInfo};
+use crate::{
+    ConnectionId, DocumentId, PeerId, SamodLoader, StorageId, UnixTimestamp,
+    network::ConnectionInfo,
+};
 
 use super::RunState;
 
@@ -151,5 +156,25 @@ impl Hub {
     /// Returns `None` if the dialer doesn't exist.
     pub fn dialer_attempt(&self, dialer_id: crate::DialerId) -> Option<u32> {
         self.state.dialer_attempt(dialer_id)
+    }
+
+    /// Sets the access policy consulted at the actor↔peer boundary.
+    ///
+    /// The policy is evaluated synchronously whenever a peer's data would reach
+    /// a document actor (inbound) or a peer would be associated with a document
+    /// actor (outbound). A peer denied for a document never has its data
+    /// forwarded to that document's actor and is never associated with it, so
+    /// it is never sent any traffic for that document.
+    ///
+    /// The default policy allows every peer to interact with every document.
+    ///
+    /// Note that peer IDs are not authenticated by the network protocol, so if
+    /// you rely on this for authorization the underlying network layer must
+    /// authenticate peers itself.
+    pub fn set_access_policy<F>(&mut self, f: F)
+    where
+        F: Fn(&DocumentId, &PeerId) -> bool + Send + Sync + 'static,
+    {
+        self.state.set_access_policy(std::sync::Arc::new(f));
     }
 }
