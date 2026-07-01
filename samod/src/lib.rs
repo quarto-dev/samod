@@ -318,6 +318,7 @@ mod actor_task;
 use actor_task::ActorTask;
 mod actor_handle;
 use actor_handle::ActorHandle;
+mod access_policy;
 mod announce_policy;
 mod builder;
 pub use builder::RepoBuilder;
@@ -348,6 +349,7 @@ mod stopped;
 pub use stopped::Stopped;
 pub mod storage;
 pub mod transport;
+pub use crate::access_policy::{AccessPolicy, AllowAll};
 pub use crate::announce_policy::{
     AlwaysAnnounce, AnnouncePolicy, LocalAnnouncePolicy, NeverAnnounce,
 };
@@ -449,18 +451,21 @@ impl Repo {
         R: runtime::RuntimeHandle + Clone + Send,
         S: Storage,
         A: AnnouncePolicy,
+        Ac: AccessPolicy,
     >(
-        builder: RepoBuilder<S, R, A>,
+        builder: RepoBuilder<S, R, A, Ac>,
     ) -> Self {
         let RepoBuilder {
             storage,
             runtime,
             peer_id,
             announce_policy,
+            access_policy,
             concurrency,
             observer,
         } = builder;
-        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency, observer).await;
+        let task_setup =
+            TaskSetup::new(storage.clone(), peer_id, concurrency, observer, access_policy).await;
         let inner = task_setup.inner.clone();
         task_setup.spawn_tasks(runtime, storage, announce_policy);
         Self { inner }
@@ -471,18 +476,21 @@ impl Repo {
         R: runtime::LocalRuntimeHandle + Clone + 'static,
         S: LocalStorage + 'a,
         A: LocalAnnouncePolicy + 'a,
+        Ac: AccessPolicy,
     >(
-        builder: RepoBuilder<S, R, A>,
+        builder: RepoBuilder<S, R, A, Ac>,
     ) -> Self {
         let RepoBuilder {
             storage,
             runtime,
             peer_id,
             announce_policy,
+            access_policy,
             concurrency,
             observer,
         } = builder;
-        let task_setup = TaskSetup::new(storage.clone(), peer_id, concurrency, observer).await;
+        let task_setup =
+            TaskSetup::new(storage.clone(), peer_id, concurrency, observer, access_policy).await;
         let inner = task_setup.inner.clone();
         task_setup.spawn_tasks_local(runtime, storage, announce_policy);
         Self { inner }
@@ -1320,15 +1328,20 @@ struct TaskSetup {
 }
 
 impl TaskSetup {
-    async fn new<S: LocalStorage>(
+    async fn new<S: LocalStorage, Ac: AccessPolicy>(
         storage: S,
         peer_id: Option<PeerId>,
         concurrency: ConcurrencyConfig,
         observer: Option<Arc<dyn observer::RepoObserver>>,
+        access_policy: Ac,
     ) -> TaskSetup {
         let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
         let peer_id = peer_id.unwrap_or_else(|| PeerId::new_with_rng(&mut rng));
-        let hub = load_hub(storage.clone(), Hub::load(peer_id.clone())).await;
+        let mut hub = load_hub(storage.clone(), Hub::load(peer_id.clone())).await;
+        // The access policy is set on the hub itself (not delivered as an
+        // effect through the io_loop) because it is consulted synchronously by
+        // the hub at the actor↔peer boundary.
+        hub.set_access_policy(move |doc_id, peer_id| access_policy.is_allowed(doc_id, peer_id));
 
         let (tx_storage, rx_storage) = unbounded::channel();
         let tx_io_for_tick = tx_storage.clone();

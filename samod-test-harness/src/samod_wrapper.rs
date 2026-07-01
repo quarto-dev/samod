@@ -534,6 +534,19 @@ impl SamodWrapper {
         self.announce_policy = policy;
     }
 
+    /// Set the access policy on the hub. Unlike the announce policy (which is
+    /// consulted by the document actors) the access policy is enforced by the
+    /// hub itself, so we install it directly.
+    pub fn set_access_policy(
+        &mut self,
+        policy: Box<dyn Fn(DocumentId, PeerId) -> bool + Send + Sync>,
+    ) {
+        self.hub
+            .set_access_policy(move |doc_id: &DocumentId, peer_id: &PeerId| {
+                policy(doc_id.clone(), peer_id.clone())
+            });
+    }
+
     pub fn broadcast(&mut self, actor_id: DocumentActorId, msg: Vec<u8>) {
         self.document_actors
             .get_mut(&actor_id)
