@@ -12,7 +12,7 @@ use crate::{
             io::{HubIoAction, HubIoResult},
             listener::ListenerState,
         },
-        messages::{Broadcast, DocMessage, DocToHubMsgPayload, HubToDocMsgPayload},
+        messages::{Broadcast, DocMessage, DocToHubMsgPayload, HubToDocMsgPayload, SyncMessage},
     },
     doc_search::DocSearchPhase,
     ephemera::{EphemeralMessage, EphemeralSession, OutgoingSessionDetails},
@@ -27,7 +27,7 @@ mod actor_info;
 pub(crate) use actor_info::ActorInfo;
 use automerge::Automerge;
 
-use super::{CommandId, CommandResult, RunState, connection::Connection};
+use super::{AccessPolicy, CommandId, CommandResult, RunState, allow_all, connection::Connection};
 mod pending_commands;
 
 mod searches;
@@ -63,6 +63,10 @@ pub(crate) struct State {
     listeners: HashMap<ListenerId, ListenerState>,
 
     searches: Searches,
+
+    /// Synchronous access-control policy consulted at the actor↔peer boundary.
+    /// Defaults to allowing every peer to interact with every document.
+    access_policy: AccessPolicy,
 }
 
 impl State {
@@ -83,7 +87,24 @@ impl State {
             dialers: HashMap::new(),
             listeners: HashMap::new(),
             searches: Searches::new(),
+            access_policy: allow_all(),
         }
+    }
+
+    /// Sets the access policy consulted at the actor↔peer boundary.
+    pub(crate) fn set_access_policy(&mut self, policy: AccessPolicy) {
+        self.access_policy = policy;
+    }
+
+    /// Resolve the established remote peer ID for a connection, if any.
+    ///
+    /// An immutable helper used by the inbound access gate so it can look up
+    /// the peer without taking the `&mut self` borrow that
+    /// [`Self::established_connection`] requires.
+    fn peer_for_connection(&self, conn_id: ConnectionId) -> Option<PeerId> {
+        self.connections
+            .get(&conn_id)
+            .and_then(|c| c.remote_peer_id().cloned())
     }
 
     /// Returns the current storage ID if it has been loaded.
@@ -292,19 +313,27 @@ impl State {
     }
 
     pub(crate) fn ensure_connections(&mut self) -> Vec<(DocumentActorId, ConnectionId, PeerId)> {
+        // Outbound access gate A: the association point for peers that connect
+        // *after* the actor exists. A denied pair is never associated (we skip
+        // it before `add_document_subscription`), so the actor never learns the
+        // peer and never sends it any document traffic. Denied pairs are
+        // deliberately left unsubscribed so a later deny→allow policy change can
+        // still take effect on a subsequent tick. `self.access_policy` is a
+        // disjoint field from `self.connections`, so calling it inside the loop
+        // borrows neither the connection nor the document map.
         let mut to_connect = Vec::new();
         for (conn_id, conn) in &mut self.connections {
             if let Some(established) = conn.established_connection_mut() {
                 for (doc_id, doc_actor) in &self.document_to_actor {
-                    if !established.document_subscriptions().contains_key(doc_id) {
-                        to_connect.push((
-                            established.remote_peer_id().clone(),
-                            *conn_id,
-                            doc_id.clone(),
-                            doc_actor,
-                        ));
-                        established.add_document_subscription(doc_id.clone());
+                    if established.document_subscriptions().contains_key(doc_id) {
+                        continue; // already associated
                     }
+                    let peer_id = established.remote_peer_id().clone();
+                    if !(self.access_policy)(doc_id, &peer_id) {
+                        continue; // denied: never associate → actor never learns this peer
+                    }
+                    to_connect.push((peer_id, *conn_id, doc_id.clone(), doc_actor));
+                    established.add_document_subscription(doc_id.clone());
                 }
             }
         }
@@ -728,6 +757,34 @@ impl State {
             tracing::trace!(?connection_id, ?msg, "ignoring message for another peer");
         }
 
+        // Inbound access gate: a denied peer's data must never reach the
+        // document actor (and hence the CRDT) and must never trigger a document
+        // load. `peer_for_connection` returns an owned `PeerId` and the policy
+        // call borrows only `self.access_policy` for its duration, so no borrow
+        // is held when we fall through to `find_actor_for_document` /
+        // `spawn_actor` below.
+        if let Some(peer_id) = self.peer_for_connection(connection_id)
+            && !(self.access_policy)(&doc_id, &peer_id)
+        {
+            tracing::debug!(?connection_id, ?peer_id, %doc_id, "access denied for inbound document message");
+            // For a sync request, answer with DocUnavailable so the requester
+            // resolves promptly (mirrors the SendSyncMessage arm). Ephemeral
+            // and other messages are simply dropped.
+            if matches!(msg, DocMessage::Sync(SyncMessage::Request { .. })) {
+                let sender_id = self.peer_id.clone();
+                if let Some((conn, _)) = self.established_connection(connection_id) {
+                    let wire = WireMessageBuilder {
+                        sender_id,
+                        target_id: peer_id,
+                        document_id: doc_id,
+                    }
+                    .from_sync_message(SyncMessage::DocUnavailable);
+                    out.send(conn, wire.encode());
+                }
+            }
+            return; // denied: no forward, no spawn
+        }
+
         // Ensure there's a document actor for this document
         if let Some(existing_actor) = self.find_actor_for_document(&doc_id) {
             // Forward the request to the document actor
@@ -862,9 +919,19 @@ impl State {
         // Create the actor and initialize it
         self.add_document_actor(actor_id, document_id.clone());
 
+        // Outbound access gate B: `spawn_actor` seeds a newly created actor with
+        // all currently-established peers, bypassing `ensure_connections`
+        // (gate A) entirely — and it marks each seeded pair subscribed below, so
+        // gate A would never re-check them. Filter denied peers out here so a
+        // denied peer that is already connected when we spawn the actor is never
+        // seeded, never marked subscribed, and hence never receives proactive
+        // sync (default `AlwaysAnnounce`) or ephemeral broadcasts. The filter
+        // borrows only `self.access_policy`; `established_peers()` has already
+        // returned an owned vec, so the later `&mut self` calls do not conflict.
         let mut initial_connections: HashMap<ConnectionId, (PeerId, Option<DocMessage>)> = self
             .established_peers()
             .iter()
+            .filter(|(_, p)| (self.access_policy)(&document_id, p))
             .map(|(c, p)| (*c, (p.clone(), None)))
             .collect();
 

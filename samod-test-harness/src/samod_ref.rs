@@ -215,6 +215,17 @@ impl SamodRef<'_> {
             .set_announce_policy(policy);
     }
 
+    pub fn set_access_policy(
+        &mut self,
+        policy: Box<dyn Fn(DocumentId, PeerId) -> bool + Send + Sync>,
+    ) {
+        self.network
+            .samods
+            .get_mut(self.samod_id)
+            .unwrap()
+            .set_access_policy(policy);
+    }
+
     pub fn pop_doc_changed(&mut self, actor_id: DocumentActorId) -> Vec<DocumentChanged> {
         self.wrapper().pop_doc_changed(actor_id)
     }
